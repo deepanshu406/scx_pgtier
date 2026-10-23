@@ -1,12 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier loader, step 1 of 7 (tier detection).
+ * scx_pgtier loader, step 2 of 7 (tier detection + express lane).
  *
- * Loads the scheduler, keeps it attached, prints how many tasks were
- * classified into each class once a second, and reports why the scheduler
- * exited. Structure follows scx_simple.c.
+ * Loads the scheduler, keeps it attached, prints the counters once a second,
+ * and reports why the scheduler exited. Structure follows scx_simple.c
+ * (Copyright (c) 2022 Meta Platforms, Inc. and affiliates;
+ *  Copyright (c) 2022 Tejun Heo <tj@kernel.org>;
+ *  Copyright (c) 2022 David Vernet <dvernet@meta.com>).
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
@@ -16,11 +19,19 @@
 #include <scx/common.h>
 #include "scx_pgtier.bpf.skel.h"
 
-/* Must match the number of entries in the "stats" map in the BPF file. */
-#define NR_STATS	3
+/*
+ * Counter names, in the order of the "stats" map in the BPF file:
+ *   0 bg, 1 ts, 2 unknown          tasks seen at enable, by class
+ *   3 ts_idle                      ts task placed on an idle CPU
+ *   4 ts_preempt                   ts task jumped the queue and kicked a bg task
+ *   5 ts_queued                    ts task queued behind a running ts task
+ *   6 ts_nudge                     ts task queued on a CPU with nothing recorded
+ *   7 bg_enq                       bg task put on the shared queue
+ */
+#define NR_STATS	8
 
 const char help_fmt[] =
-"Tier-detection step of scx_pgtier (partial mode).\n"
+"scx_pgtier, step 2: tier detection and express lane (partial mode).\n"
 "\n"
 "Only tasks switched to SCHED_EXT are scheduled by this scheduler.\n"
 "cgroup names: ufs-ts-* = time-sensitive, ufs-bg-* = background.\n"
@@ -45,7 +56,7 @@ static void sigint_handler(int sig)
 	exit_req = 1;
 }
 
-/* Sum the per-CPU counters of each class. */
+/* Sum the per-CPU counters of each stat. */
 static void read_stats(struct scx_pgtier *skel, __u64 *stats)
 {
 	int nr_cpus = libbpf_num_possible_cpus();
@@ -91,15 +102,28 @@ restart:
 		}
 	}
 
+	/* The stats map and this file must agree on the number of counters. */
+	if (bpf_map__max_entries(skel->maps.stats) != NR_STATS) {
+		fprintf(stderr, "stats map has %u entries, loader expects %d\n",
+			bpf_map__max_entries(skel->maps.stats), NR_STATS);
+		return 1;
+	}
+
+	/* Tell the BPF side how many CPUs to scan. */
+	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
+
 	SCX_OPS_LOAD(skel, pgtier_ops, scx_pgtier, uei);
 	link = SCX_OPS_ATTACH(skel, pgtier_ops, scx_pgtier);
 
 	while (!exit_req && !UEI_EXITED(skel, uei)) {
-		__u64 stats[NR_STATS];
+		__u64 s[NR_STATS];
 
-		read_stats(skel, stats);
-		printf("bg=%llu ts=%llu unknown=%llu\n",
-		       stats[0], stats[1], stats[2]);
+		read_stats(skel, s);
+		/* Keep the "bg= ts= unknown=" prefix: the step 1 test parses it. */
+		printf("bg=%llu ts=%llu unknown=%llu "
+		       "ts_idle=%llu ts_preempt=%llu ts_queued=%llu ts_nudge=%llu "
+		       "bg_enq=%llu\n",
+		       s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
 		fflush(stdout);
 		sleep(1);
 	}

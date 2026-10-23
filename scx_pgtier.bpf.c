@@ -1,19 +1,32 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier: step 1 of 7, tier detection only.
+ * scx_pgtier: step 2 of 7, the express lane.
  *
- * What it does:
- *   - When a task joins sched_ext (enable), read the NAME of its cgroup.
- *   - "ufs-ts-*" -> time-sensitive tier, "ufs-bg-*" -> background tier,
- *     anything else -> counted as unknown and treated as background.
- *   - Remember the tier per task (task storage) and count the results.
+ * Step 1 (kept): when a task joins sched_ext (enable), read the NAME of its
+ * cgroup. "ufs-ts-*" -> time-sensitive tier, "ufs-bg-*" -> background tier,
+ * anything else -> counted as unknown and treated as background.
  *
- * What it does NOT do yet:
- *   - No express lane, no cgroup queues, no vtime. Scheduling is plain FIFO
- *     (same as scx_simple) so the machine keeps working.
- *   - It does not notice a task that moves to another cgroup later.
+ * Step 2 (new): time-sensitive tasks get a CPU quickly.
+ *   select_cpu, time-sensitive task:
+ *     1. idle CPU (previous one first)  -> insert straight into its local queue
+ *     2. else a CPU recorded as running a background task -> return that CPU
+ *     3. else the default CPU (all CPUs run time-sensitive work)
+ *   enqueue, time-sensitive task, on the CPU chosen above:
+ *     - CPU runs background work  -> insert at the HEAD of its local queue and
+ *                                    kick it with PREEMPT (the express lane)
+ *     - CPU runs time-sensitive   -> insert behind it, no kick (collision rule:
+ *                                    time-sensitive tasks never preempt each other)
+ *     - nothing recorded          -> insert and kick without preempt (wake it)
+ *   Background tasks are unchanged: one shared FIFO queue.
+ *
+ * Not yet: virtual runtime, weights, per-cgroup queues (step 3).
  *
  * Run it in PARTIAL mode: only tasks switched to SCHED_EXT are ours.
+ *
+ * The scheduling callbacks follow tools/sched_ext/scx_simple.bpf.c
+ * (Copyright (c) 2022 Meta Platforms, Inc. and affiliates;
+ *  Copyright (c) 2022 Tejun Heo <tj@kernel.org>;
+ *  Copyright (c) 2022 David Vernet <dvernet@meta.com>).
  */
 #include <scx/common.bpf.h>
 
@@ -26,18 +39,43 @@ UEI_DEFINE(uei);
 /* Set to 0 to silence the trace_pipe output. */
 #define UFS_DEBUG	1
 
+/* Slice for time-sensitive tasks: short, so a task queued behind one waits little. */
+#define TS_SLICE_NS	(2 * 1000 * 1000ULL)
+
+#define MAX_CPUS	1024
+
+/* Number of possible CPUs; the loader fills this in before loading. */
+const volatile u32 nr_cpus = MAX_CPUS;
+
 /* Tier stored on each task. */
 enum ufs_tier {
 	TIER_BG = 0,
 	TIER_TS = 1,
 };
 
-/* What the name check found. Used as the index into the stats map. */
+/* What the name check found. */
 enum ufs_class {
 	CLASS_BG = 0,		/* name starts with "ufs-bg-" */
 	CLASS_TS = 1,		/* name starts with "ufs-ts-" */
 	CLASS_UNKNOWN = 2,	/* any other name, or the name could not be read */
 	NR_CLASSES,
+};
+
+/* Index into the stats map. 0..NR_CLASSES-1 are the ufs_class values. */
+enum ufs_stat {
+	ST_TS_IDLE = NR_CLASSES,	/* ts task placed on an idle CPU in select_cpu */
+	ST_TS_PREEMPT,			/* ts task jumped the queue and kicked a bg task */
+	ST_TS_QUEUED,			/* ts task queued behind a running ts task */
+	ST_TS_NUDGE,			/* ts task queued on a CPU with nothing recorded */
+	ST_BG_ENQ,			/* bg task put on the shared queue */
+	UFS_NR_STATS,
+};
+
+/* What a CPU is running, as recorded by running()/stopping(). 0 = nothing. */
+enum ufs_cpu_state {
+	CPU_NONE = 0,
+	CPU_BG = 1,
+	CPU_TS = 2,
 };
 
 #define NAME_LEN	32	/* we only need the first few characters */
@@ -54,11 +92,23 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctxs SEC(".maps");
 
+/*
+ * One entry per CPU. Written by the CPU itself in running()/stopping(), read by
+ * other CPUs in select_cpu(). A plain array (not per-CPU) because we read other
+ * CPUs' entries. Reads can be slightly stale; that is tolerated.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_CPUS);
+	__type(key, u32);
+	__type(value, u8);
+} cpu_state SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u64));
-	__uint(max_entries, NR_CLASSES);
+	__uint(max_entries, UFS_NR_STATS);
 } stats SEC(".maps");
 
 static void stat_inc(u32 idx)
@@ -67,6 +117,30 @@ static void stat_inc(u32 idx)
 
 	if (cnt)
 		(*cnt)++;
+}
+
+static __always_inline u8 task_tier(struct task_struct *p)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+
+	return tctx ? tctx->tier : TIER_BG;
+}
+
+static __always_inline u8 cpu_state_of(s32 cpu)
+{
+	u32 key = cpu;
+	u8 *st = bpf_map_lookup_elem(&cpu_state, &key);
+
+	return st ? *st : CPU_NONE;
+}
+
+static __always_inline void cpu_state_set(u8 state)
+{
+	u32 key = bpf_get_smp_processor_id();
+	u8 *st = bpf_map_lookup_elem(&cpu_state, &key);
+
+	if (st)
+		*st = state;
 }
 
 /* True if the first PREFIX_LEN characters of name equal prefix. */
@@ -103,22 +177,101 @@ static __always_inline int classify(struct task_struct *p, char *name)
 	return CLASS_UNKNOWN;
 }
 
-/* ---- scheduling: plain FIFO, copied from the scx_simple pattern ---- */
+/*
+ * Look for a CPU that is recorded as running a background task, starting at
+ * prev_cpu and wrapping around. Skips CPUs the task is not allowed to run on.
+ * Returns -1 if there is none.
+ */
+static __always_inline s32 find_bg_cpu(struct task_struct *p, s32 prev_cpu)
+{
+	u32 nr = nr_cpus;
+	int i;
+
+	if (nr == 0 || nr > MAX_CPUS)
+		nr = MAX_CPUS;
+	if (prev_cpu < 0 || (u32)prev_cpu >= nr)
+		prev_cpu = 0;
+
+	bpf_for(i, 0, MAX_CPUS) {
+		s32 cpu;
+
+		if ((u32)i >= nr)
+			break;
+		cpu = (prev_cpu + i) % nr;
+		if (cpu_state_of(cpu) == CPU_BG &&
+		    bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+			return cpu;
+	}
+	return -1;
+}
+
+/* ---- scheduling ---- */
 
 s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	bool is_idle = false;
+	bool ts = task_tier(p) == TIER_TS;
 	s32 cpu;
 
+	/* 1 and 2: an idle CPU, previous CPU first. Same helper as step 1. */
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle)
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+	if (is_idle) {
+		if (ts) {
+			stat_inc(ST_TS_IDLE);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, TS_SLICE_NS, 0);
+		} else {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		}
+		return cpu;
+	}
+
+	/*
+	 * No idle CPU. A time-sensitive task prefers a CPU running background
+	 * work. We only RETURN the CPU here; enqueue() inserts the task and
+	 * kicks, so the insert happens before the kick.
+	 */
+	if (ts) {
+		s32 bg_cpu = find_bg_cpu(p, prev_cpu);
+
+		if (bg_cpu >= 0)
+			return bg_cpu;
+	}
 	return cpu;
 }
 
 void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+	s32 cpu;
+	u8 state;
+
+	if (task_tier(p) != TIER_TS) {
+		stat_inc(ST_BG_ENQ);
+		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+		return;
+	}
+
+	/* The CPU select_cpu() chose, or the CPU the task was running on. */
+	cpu = scx_bpf_task_cpu(p);
+	state = cpu_state_of(cpu);
+
+	if (state == CPU_BG) {
+		/* Express lane: go first and push the background task off. */
+		stat_inc(ST_TS_PREEMPT);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS,
+				   enq_flags | SCX_ENQ_HEAD);
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
+	} else if (state == CPU_TS) {
+		/* Collision: never preempt another time-sensitive task. */
+		stat_inc(ST_TS_QUEUED);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS,
+				   enq_flags);
+	} else {
+		/* Nothing recorded: idle, or the task just stopped here. */
+		stat_inc(ST_TS_NUDGE);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS,
+				   enq_flags);
+		scx_bpf_kick_cpu(cpu, 0);
+	}
 }
 
 void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
@@ -126,7 +279,18 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 	scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 
-/* ---- tier detection happens here ---- */
+/* Record what each CPU is running. */
+void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
+{
+	cpu_state_set(task_tier(p) == TIER_TS ? CPU_TS : CPU_BG);
+}
+
+void BPF_STRUCT_OPS(ufs_stopping, struct task_struct *p, bool runnable)
+{
+	cpu_state_set(CPU_NONE);
+}
+
+/* ---- tier detection happens here (step 1) ---- */
 
 void BPF_STRUCT_OPS(ufs_enable, struct task_struct *p)
 {
@@ -161,6 +325,8 @@ SCX_OPS_DEFINE(pgtier_ops,
 	       .select_cpu	= (void *)ufs_select_cpu,
 	       .enqueue		= (void *)ufs_enqueue,
 	       .dispatch	= (void *)ufs_dispatch,
+	       .running		= (void *)ufs_running,
+	       .stopping	= (void *)ufs_stopping,
 	       .enable		= (void *)ufs_enable,
 	       .init		= (void *)ufs_init,
 	       .exit		= (void *)ufs_exit,
