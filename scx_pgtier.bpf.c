@@ -1,6 +1,20 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier: step 2 of 7, the express lane.
+ * scx_pgtier: step 3A of 7, per-cgroup records and queues (nothing uses the
+ * queues yet), on top of step 2, the express lane, and step 1, tier detection.
+ *
+ * Step 3A (new): sched_ext tells us when a cgroup appears (cgroup_init) and
+ * when it goes away (cgroup_exit).
+ *   cgroup_init: read the cgroup's NAME, store a record on the cgroup
+ *                (tier, queue id), and for a "ufs-bg-*" cgroup create its own
+ *                queue (a DSQ). The queue id is the cgroup's own id.
+ *   cgroup_exit: destroy that queue.
+ * Nothing is put in these queues yet, and dispatch does not read them. Background
+ * tasks still use the single shared FIFO queue. This step only proves that the
+ * records and queues are created and destroyed correctly.
+ *
+ * NOTE: the cpu controller must be enabled for a cgroup to get its own
+ * cgroup_init call (echo +cpu > /sys/fs/cgroup/cgroup.subtree_control).
  *
  * Step 1 (kept): when a task joins sched_ext (enable), read the NAME of its
  * cgroup. "ufs-ts-*" -> time-sensitive tier, "ufs-bg-*" -> background tier,
@@ -19,7 +33,7 @@
  *     - nothing recorded          -> insert and kick without preempt (wake it)
  *   Background tasks are unchanged: one shared FIFO queue.
  *
- * Not yet: virtual runtime, weights, per-cgroup queues (step 3).
+ * Not yet: virtual runtime, weights, using the per-cgroup queues (rest of step 3).
  *
  * Run it in PARTIAL mode: only tasks switched to SCHED_EXT are ours.
  *
@@ -68,6 +82,11 @@ enum ufs_stat {
 	ST_TS_QUEUED,			/* ts task queued behind a running ts task */
 	ST_TS_NUDGE,			/* ts task queued on a CPU with nothing recorded */
 	ST_BG_ENQ,			/* bg task put on the shared queue */
+	ST_CGRP_BG,			/* "ufs-bg-*" cgroup seen: record made, queue created */
+	ST_CGRP_TS,			/* "ufs-ts-*" cgroup seen: record made, no queue */
+	ST_CGRP_OTHER,			/* any other cgroup seen: record made, no queue */
+	ST_CGRP_DESTROYED,		/* a cgroup queue was destroyed in cgroup_exit */
+	ST_CGRP_ERR,			/* creating a record or queue failed */
 	UFS_NR_STATS,
 };
 
@@ -91,6 +110,20 @@ struct {
 	__type(key, int);
 	__type(value, struct task_ctx);
 } task_ctxs SEC(".maps");
+
+/* Per-cgroup record, created in cgroup_init. */
+struct cgrp_ctx {
+	u8  tier;	/* TIER_TS or TIER_BG */
+	u8  has_dsq;	/* 1 if this cgroup owns a queue */
+	u64 dsq_id;	/* the queue's id: the cgroup's own id */
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct cgrp_ctx);
+} cgrp_ctxs SEC(".maps");
 
 /*
  * One entry per CPU. Written by the CPU itself in running()/stopping(), read by
@@ -155,15 +188,11 @@ static __always_inline bool has_prefix(const char *name, const char *prefix)
 }
 
 /*
- * Read the name of the task's cgroup (unified hierarchy) and classify it.
- * Reads p->cgroups->dfl_cgrp->kn->name with CO-RE. This needs no kfunc and no
- * reference counting.
+ * Copy the cgroup name that namep points to into name, and classify it by its
+ * prefix.
  */
-static __always_inline int classify(struct task_struct *p, char *name)
+static __always_inline int classify_name(const char *namep, char *name)
 {
-	const char *namep;
-
-	namep = BPF_CORE_READ(p, cgroups, dfl_cgrp, kn, name);
 	if (!namep)
 		return CLASS_UNKNOWN;
 
@@ -175,6 +204,16 @@ static __always_inline int classify(struct task_struct *p, char *name)
 	if (has_prefix(name, "ufs-bg-"))
 		return CLASS_BG;
 	return CLASS_UNKNOWN;
+}
+
+/*
+ * Read the name of the task's cgroup (unified hierarchy) and classify it.
+ * Reads p->cgroups->dfl_cgrp->kn->name with CO-RE. This needs no kfunc and no
+ * reference counting.
+ */
+static __always_inline int classify(struct task_struct *p, char *name)
+{
+	return classify_name(BPF_CORE_READ(p, cgroups, dfl_cgrp, kn, name), name);
 }
 
 /*
@@ -311,6 +350,69 @@ void BPF_STRUCT_OPS(ufs_enable, struct task_struct *p)
 #endif
 }
 
+/* ---- per-cgroup records and queues (step 3A) ---- */
+
+/*
+ * A cgroup is being enabled in sched_ext. This is called once for every cgroup
+ * that already exists when the scheduler starts, and then for each new one. It
+ * is sleepable, so creating a queue here is allowed.
+ */
+s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_cgroup_init, struct cgroup *cgrp,
+			     struct scx_cgroup_init_args *args)
+{
+	char name[NAME_LEN] = {};
+	struct cgrp_ctx *cctx;
+	u64 id = BPF_CORE_READ(cgrp, kn, id);
+	int class, ret;
+
+	class = classify_name(BPF_CORE_READ(cgrp, kn, name), name);
+
+	cctx = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
+	if (!cctx) {
+		stat_inc(ST_CGRP_ERR);
+		return -12;	/* -ENOMEM */
+	}
+
+	cctx->tier = (class == CLASS_TS) ? TIER_TS : TIER_BG;
+	cctx->dsq_id = id;
+	cctx->has_dsq = 0;
+
+	if (class == CLASS_BG) {
+		/* Only background cgroups get their own queue. */
+		ret = scx_bpf_create_dsq(id, -1);
+		if (ret) {
+			stat_inc(ST_CGRP_ERR);
+			return ret;
+		}
+		cctx->has_dsq = 1;
+		stat_inc(ST_CGRP_BG);
+	} else if (class == CLASS_TS) {
+		stat_inc(ST_CGRP_TS);
+	} else {
+		stat_inc(ST_CGRP_OTHER);
+	}
+
+#if UFS_DEBUG
+	bpf_printk("ufs: cgroup_init id=%llu name=%s class=%d", id, name, class);
+#endif
+	return 0;
+}
+
+/* The cgroup is going away: destroy its queue, if it had one. */
+void BPF_STRUCT_OPS(ufs_cgroup_exit, struct cgroup *cgrp)
+{
+	struct cgrp_ctx *cctx = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0, 0);
+
+	if (cctx && cctx->has_dsq) {
+		scx_bpf_destroy_dsq(cctx->dsq_id);
+		cctx->has_dsq = 0;
+		stat_inc(ST_CGRP_DESTROYED);
+#if UFS_DEBUG
+		bpf_printk("ufs: cgroup_exit id=%llu queue destroyed", cctx->dsq_id);
+#endif
+	}
+}
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_init)
 {
 	return scx_bpf_create_dsq(SHARED_DSQ, -1);
@@ -328,6 +430,8 @@ SCX_OPS_DEFINE(pgtier_ops,
 	       .running		= (void *)ufs_running,
 	       .stopping	= (void *)ufs_stopping,
 	       .enable		= (void *)ufs_enable,
+	       .cgroup_init	= (void *)ufs_cgroup_init,
+	       .cgroup_exit	= (void *)ufs_cgroup_exit,
 	       .init		= (void *)ufs_init,
 	       .exit		= (void *)ufs_exit,
 	       .flags		= SCX_OPS_SWITCH_PARTIAL,
