@@ -1,34 +1,43 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier: step 3B of 7, cgroup weights, on top of step 3A (per-cgroup
- * records and queues), step 2 (the express lane) and step 1 (tier detection).
+ * scx_pgtier: step 3C of 7, cgroup virtual clocks and weighted dispatch, on
+ * top of 3B (cgroup weights), 3A (per-cgroup records and queues), step 2 (the
+ * express lane) and step 1 (tier detection).
  *
- * Step 3B (new): every cgroup record also stores the cgroup's cpu.weight.
- *   - The starting weight comes in the arguments of cgroup_init.
- *   - When someone writes to cpu.weight, cgroup_set_weight updates it.
- *   - The stored weight is clamped to 1..10000 (the range of cpu.weight).
- * Nothing uses the weight yet; the cgroup virtual clock (step 3C) will.
- * Assumption: our "ufs-" cgroups are siblings under one parent (no nesting
- * inside them).
+ * Step 3C (new):
+ *   - A table of UFS_MAX_SLOTS "slots". Slot 0 stands for the shared queue.
+ *     Every "ufs-bg-*" cgroup gets one slot in cgroup_init. A slot holds the
+ *     cgroup's virtual clock (vtime), weight and queue id.
+ *   - Background tasks are put in their cgroup's queue (enqueue), ordered by
+ *     their own task clock. A background task whose cgroup has no queue uses
+ *     the shared queue (slot 0).
+ *   - Task clock: advanced in stopping() by the time the task really ran,
+ *     divided by its weight (as scx_simple does).
+ *   - dispatch(): scan the slots, pick the READY slot with the lowest cgroup
+ *     clock among those with waiting tasks, take its first task, and charge
+ *     that cgroup SCX_SLICE_DFL * 100 / weight. If the queue was emptied by
+ *     another CPU in the meantime, try again (a few times).
+ *   - A new cgroup's clock starts at cg_vtime_now (the clock of the cgroup most
+ *     recently picked), so it does not start far behind the others.
+ * Not yet: the clamp for a cgroup that was idle (step 3D), the rbtree instead
+ * of the scan, unknown cgroups as their own slots.
  *
- * Step 3A (new): sched_ext tells us when a cgroup appears (cgroup_init) and
- * when it goes away (cgroup_exit).
- *   cgroup_init: read the cgroup's NAME, store a record on the cgroup
- *                (tier, queue id), and for a "ufs-bg-*" cgroup create its own
- *                queue (a DSQ). The queue id is the cgroup's own id.
- *   cgroup_exit: destroy that queue.
- * Nothing is put in these queues yet, and dispatch does not read them. Background
- * tasks still use the single shared FIFO queue. This step only proves that the
- * records and queues are created and destroyed correctly.
+ * Known limits:
+ *   - A task's slot is read once, in enable(). Move the task into its cgroup
+ *     BEFORE switching it to SCHED_EXT. A later move is not noticed.
+ *   - Tasks that sit in the shared or a cgroup queue while their cgroup is
+ *     removed are not handled.
  *
- * NOTE: the cpu controller must be enabled for a cgroup to get its own
- * cgroup_init call (echo +cpu > /sys/fs/cgroup/cgroup.subtree_control).
+ * Step 3B: every cgroup record stores the cgroup's cpu.weight (starting value
+ * from the cgroup_init arguments, updates from cgroup_set_weight, clamped to
+ * 1..10000). Assumption: our "ufs-" cgroups are siblings under one parent.
  *
- * Step 1 (kept): when a task joins sched_ext (enable), read the NAME of its
- * cgroup. "ufs-ts-*" -> time-sensitive tier, "ufs-bg-*" -> background tier,
- * anything else -> counted as unknown and treated as background.
+ * Step 3A: cgroup_init reads the cgroup NAME, stores a record on the cgroup and,
+ * for a "ufs-bg-*" cgroup, creates its own queue (DSQ) with the cgroup's id.
+ * cgroup_exit destroys it. The cpu controller must be enabled for a cgroup to
+ * get its own cgroup_init call (echo +cpu > /sys/fs/cgroup/cgroup.subtree_control).
  *
- * Step 2 (new): time-sensitive tasks get a CPU quickly.
+ * Step 2: time-sensitive tasks get a CPU quickly.
  *   select_cpu, time-sensitive task:
  *     1. idle CPU (previous one first)  -> insert straight into its local queue
  *     2. else a CPU recorded as running a background task -> return that CPU
@@ -39,9 +48,10 @@
  *     - CPU runs time-sensitive   -> insert behind it, no kick (collision rule:
  *                                    time-sensitive tasks never preempt each other)
  *     - nothing recorded          -> insert and kick without preempt (wake it)
- *   Background tasks are unchanged: one shared FIFO queue.
  *
- * Not yet: virtual runtime, weights, using the per-cgroup queues (rest of step 3).
+ * Step 1: when a task joins sched_ext (enable), read the NAME of its cgroup.
+ * "ufs-ts-*" -> time-sensitive tier, "ufs-bg-*" -> background tier, anything
+ * else -> counted as unknown and treated as background.
  *
  * Run it in PARTIAL mode: only tasks switched to SCHED_EXT are ours.
  *
@@ -51,11 +61,13 @@
  *  Copyright (c) 2022 David Vernet <dvernet@meta.com>).
  */
 #include <scx/common.bpf.h>
+#include "scx_pgtier.h"
 
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
+/* Id of the shared queue. It belongs to slot 0. */
 #define SHARED_DSQ	0
 
 /* Set to 0 to silence the trace_pipe output. */
@@ -64,10 +76,16 @@ UEI_DEFINE(uei);
 /* Slice for time-sensitive tasks: short, so a task queued behind one waits little. */
 #define TS_SLICE_NS	(2 * 1000 * 1000ULL)
 
+/* How many times dispatch() tries again after losing a race for a queue. */
+#define UFS_MAX_PICK_TRIES	4
+
 #define MAX_CPUS	1024
 
 /* Number of possible CPUs; the loader fills this in before loading. */
 const volatile u32 nr_cpus = MAX_CPUS;
+
+/* Clock of the cgroup picked most recently. A new cgroup's clock starts here. */
+u64 cg_vtime_now;
 
 /* Tier stored on each task. */
 enum ufs_tier {
@@ -89,13 +107,16 @@ enum ufs_stat {
 	ST_TS_PREEMPT,			/* ts task jumped the queue and kicked a bg task */
 	ST_TS_QUEUED,			/* ts task queued behind a running ts task */
 	ST_TS_NUDGE,			/* ts task queued on a CPU with nothing recorded */
-	ST_BG_ENQ,			/* bg task put on the shared queue */
+	ST_BG_ENQ,			/* bg task put on the shared queue (slot 0) */
 	ST_CGRP_BG,			/* "ufs-bg-*" cgroup seen: record made, queue created */
 	ST_CGRP_TS,			/* "ufs-ts-*" cgroup seen: record made, no queue */
 	ST_CGRP_OTHER,			/* any other cgroup seen: record made, no queue */
 	ST_CGRP_DESTROYED,		/* a cgroup queue was destroyed in cgroup_exit */
 	ST_CGRP_ERR,			/* creating a record or queue failed */
 	ST_CGRP_WSET,			/* cgroup_set_weight was called */
+	ST_BG_CGQ,			/* bg task put on a cgroup queue */
+	ST_DISP_OK,			/* dispatch moved a task to a CPU's local queue */
+	ST_DISP_RETRY,			/* dispatch lost a race for a queue and tried again */
 	UFS_NR_STATS,
 };
 
@@ -110,7 +131,8 @@ enum ufs_cpu_state {
 #define PREFIX_LEN	7	/* strlen("ufs-ts-") == strlen("ufs-bg-") */
 
 struct task_ctx {
-	u8 tier;
+	u8  tier;
+	u32 slot;	/* index into the slots table; 0 = shared queue */
 };
 
 struct {
@@ -123,8 +145,9 @@ struct {
 /* Per-cgroup record, created in cgroup_init. */
 struct cgrp_ctx {
 	u8  tier;	/* TIER_TS or TIER_BG */
-	u8  has_dsq;	/* 1 if this cgroup owns a queue */
+	u8  has_dsq;	/* 1 if this cgroup owns a queue and a slot */
 	u32 weight;	/* cpu.weight, clamped to 1..10000 */
+	u32 slot;	/* index into the slots table (0 if has_dsq is 0) */
 	u64 dsq_id;	/* the queue's id: the cgroup's own id */
 };
 
@@ -137,6 +160,17 @@ struct {
 	__type(key, int);
 	__type(value, struct cgrp_ctx);
 } cgrp_ctxs SEC(".maps");
+
+/*
+ * The slots table. dispatch() loops over it to find the cgroup with the lowest
+ * clock. Entry 0 is the shared queue; entries 1.. belong to ufs-bg-* cgroups.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, UFS_MAX_SLOTS);
+	__type(key, u32);
+	__type(value, struct ufs_slot);
+} slots SEC(".maps");
 
 /*
  * One entry per CPU. Written by the CPU itself in running()/stopping(), read by
@@ -163,6 +197,11 @@ static void stat_inc(u32 idx)
 
 	if (cnt)
 		(*cnt)++;
+}
+
+static __always_inline struct ufs_slot *slot_get(u32 idx)
+{
+	return bpf_map_lookup_elem(&slots, &idx);
 }
 
 static __always_inline u8 task_tier(struct task_struct *p)
@@ -267,6 +306,83 @@ static __always_inline s32 find_bg_cpu(struct task_struct *p, s32 prev_cpu)
 	return -1;
 }
 
+/* ---- the slots table ---- */
+
+/* Claim a free slot (1..UFS_MAX_SLOTS-1). Returns its index, or 0 if none is free. */
+static __always_inline u32 alloc_slot(void)
+{
+	int i;
+
+	bpf_for(i, 1, UFS_MAX_SLOTS) {
+		struct ufs_slot *s = slot_get(i);
+
+		if (s && __sync_val_compare_and_swap(&s->state, UFS_SLOT_FREE,
+						     UFS_SLOT_FILLING) == UFS_SLOT_FREE)
+			return i;
+	}
+	return 0;
+}
+
+static __always_inline void free_slot(struct ufs_slot *s)
+{
+	s->vtime = 0;
+	s->tvtime_now = 0;
+	s->dsq_id = 0;
+	s->weight = 0;
+	s->state = UFS_SLOT_FREE;
+}
+
+/*
+ * The READY slot with the lowest cgroup clock among those with waiting tasks.
+ * Returns its index, or -1 if every queue is empty.
+ */
+static __always_inline int pick_slot(void)
+{
+	u64 best_vtime = 0;
+	int best = -1;
+	int i;
+
+	bpf_for(i, 0, UFS_MAX_SLOTS) {
+		struct ufs_slot *s = slot_get(i);
+
+		if (!s || s->state != UFS_SLOT_READY)
+			continue;
+		if (scx_bpf_dsq_nr_queued(s->dsq_id) <= 0)
+			continue;
+		if (best < 0 || time_before(s->vtime, best_vtime)) {
+			best = i;
+			best_vtime = s->vtime;
+		}
+	}
+	return best;
+}
+
+/* Put a background task on its cgroup's queue, or on the shared queue. */
+static __always_inline void enqueue_bg(struct task_struct *p, u64 enq_flags)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+	u32 slot = tctx ? tctx->slot : 0;
+	struct ufs_slot *s = slot_get(slot);
+	u64 vtime = p->scx.dsq_vtime;
+
+	if (!s || s->state != UFS_SLOT_READY) {
+		/* The cgroup's queue is gone: use the shared queue. */
+		slot = 0;
+		s = slot_get(0);
+		if (!s) {
+			scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+			return;
+		}
+	}
+
+	/* A task that has been idle may only be one slice behind the others. */
+	if (time_before(vtime, s->tvtime_now - SCX_SLICE_DFL))
+		vtime = s->tvtime_now - SCX_SLICE_DFL;
+
+	stat_inc(slot ? ST_BG_CGQ : ST_BG_ENQ);
+	scx_bpf_dsq_insert_vtime(p, s->dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
+}
+
 /* ---- scheduling ---- */
 
 s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -307,8 +423,7 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 	u8 state;
 
 	if (task_tier(p) != TIER_TS) {
-		stat_inc(ST_BG_ENQ);
-		scx_bpf_dsq_insert(p, SHARED_DSQ, SCX_SLICE_DFL, enq_flags);
+		enqueue_bg(p, enq_flags);
 		return;
 	}
 
@@ -336,44 +451,113 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 }
 
+/*
+ * This CPU's local queue is empty: pick the cgroup with the lowest clock, take
+ * its first task, and charge the cgroup for one slice.
+ */
 void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 {
-	scx_bpf_dsq_move_to_local(SHARED_DSQ);
+	int tries;
+
+	bpf_for(tries, 0, UFS_MAX_PICK_TRIES) {
+		int idx = pick_slot();
+		struct ufs_slot *s;
+		u32 weight;
+
+		if (idx < 0)
+			return;
+
+		s = slot_get(idx);
+		if (!s || s->state != UFS_SLOT_READY)
+			continue;
+
+		if (scx_bpf_dsq_move_to_local(s->dsq_id)) {
+			/* Remember where the clocks are now (racy, tolerated). */
+			if (time_before(cg_vtime_now, s->vtime))
+				cg_vtime_now = s->vtime;
+
+			/* Charge: slice * 100 / weight. A heavier cgroup pays less. */
+			weight = s->weight ? s->weight : 100;
+			__sync_fetch_and_add(&s->vtime, SCX_SLICE_DFL * 100 / weight);
+
+			stat_inc(ST_DISP_OK);
+			return;
+		}
+		/* Another CPU emptied the queue first: look again. */
+		stat_inc(ST_DISP_RETRY);
+	}
 }
 
-/* Record what each CPU is running. */
+/* Record what each CPU is running, and how far the cgroup's tasks have got. */
 void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
 {
-	cpu_state_set(task_tier(p) == TIER_TS ? CPU_TS : CPU_BG);
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+	u8 tier = tctx ? tctx->tier : TIER_BG;
+
+	cpu_state_set(tier == TIER_TS ? CPU_TS : CPU_BG);
+
+	if (tier == TIER_BG) {
+		struct ufs_slot *s = slot_get(tctx ? tctx->slot : 0);
+
+		if (s && time_before(s->tvtime_now, p->scx.dsq_vtime))
+			s->tvtime_now = p->scx.dsq_vtime;	/* racy, tolerated */
+	}
 }
 
 void BPF_STRUCT_OPS(ufs_stopping, struct task_struct *p, bool runnable)
 {
 	cpu_state_set(CPU_NONE);
+
+	/* Task clock: time actually used, divided by the task's weight. */
+	if (task_tier(p) == TIER_BG)
+		p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
 }
 
-/* ---- tier detection happens here (step 1) ---- */
+/* ---- a task joins sched_ext: tier detection (step 1) and its queue (3C) ---- */
 
 void BPF_STRUCT_OPS(ufs_enable, struct task_struct *p)
 {
 	char name[NAME_LEN] = {};
 	struct task_ctx *tctx;
+	struct cgroup *cgrp;
+	struct ufs_slot *s;
+	u32 slot = 0;
 	int class;
 
 	class = classify(p, name);
 	stat_inc(class);
 
 	tctx = bpf_task_storage_get(&task_ctxs, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (tctx)
-		tctx->tier = (class == CLASS_TS) ? TIER_TS : TIER_BG;
+	if (!tctx)
+		return;
+	tctx->tier = (class == CLASS_TS) ? TIER_TS : TIER_BG;
+
+	/*
+	 * Which queue? The one of the task's cgroup, if that cgroup has one.
+	 * ops.enable() is a place where scx_bpf_task_cgroup() may be asked about
+	 * the task. It returns a reference that must be released.
+	 */
+	cgrp = scx_bpf_task_cgroup(p);
+	if (cgrp) {
+		struct cgrp_ctx *cctx = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0, 0);
+
+		if (cctx && cctx->has_dsq)
+			slot = cctx->slot;
+		bpf_cgroup_release(cgrp);
+	}
+	tctx->slot = slot;
+
+	/* Start the task's clock where its cgroup's tasks are now. */
+	s = slot_get(slot);
+	p->scx.dsq_vtime = s ? s->tvtime_now : 0;
 
 #if UFS_DEBUG
-	bpf_printk("ufs: pid=%d comm=%s cgroup=%s class=%d",
-		   p->pid, p->comm, name, class);
+	bpf_printk("ufs: pid=%d comm=%s cgroup=%s class=%d slot=%u",
+		   p->pid, p->comm, name, class, slot);
 #endif
 }
 
-/* ---- per-cgroup records and queues (step 3A) ---- */
+/* ---- per-cgroup records, queues and slots (steps 3A to 3C) ---- */
 
 /*
  * A cgroup is being enabled in sched_ext. This is called once for every cgroup
@@ -386,6 +570,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_cgroup_init, struct cgroup *cgrp,
 	char name[NAME_LEN] = {};
 	struct cgrp_ctx *cctx;
 	u64 id = BPF_CORE_READ(cgrp, kn, id);
+	u32 slot = 0;
 	int class, ret;
 
 	class = classify_name(BPF_CORE_READ(cgrp, kn, name), name);
@@ -400,16 +585,41 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_cgroup_init, struct cgroup *cgrp,
 	cctx->weight = clamp_weight(args->weight);
 	cctx->dsq_id = id;
 	cctx->has_dsq = 0;
+	cctx->slot = 0;
 
 	if (class == CLASS_BG) {
-		/* Only background cgroups get their own queue. */
-		ret = scx_bpf_create_dsq(id, -1);
-		if (ret) {
+		/*
+		 * Only background cgroups get a queue and a slot. If we run out
+		 * of slots or the queue cannot be created, the cgroup still
+		 * works: its tasks use the shared queue.
+		 */
+		slot = alloc_slot();
+		if (!slot) {
 			stat_inc(ST_CGRP_ERR);
-			return ret;
+		} else {
+			ret = scx_bpf_create_dsq(id, -1);
+			if (ret) {
+				struct ufs_slot *s = slot_get(slot);
+
+				if (s)
+					free_slot(s);
+				slot = 0;
+				stat_inc(ST_CGRP_ERR);
+			} else {
+				struct ufs_slot *s = slot_get(slot);
+
+				if (s) {
+					s->dsq_id = id;
+					s->weight = cctx->weight;
+					s->vtime = cg_vtime_now;
+					s->tvtime_now = 0;
+					s->state = UFS_SLOT_READY;
+					cctx->has_dsq = 1;
+					cctx->slot = slot;
+				}
+				stat_inc(ST_CGRP_BG);
+			}
 		}
-		cctx->has_dsq = 1;
-		stat_inc(ST_CGRP_BG);
 	} else if (class == CLASS_TS) {
 		stat_inc(ST_CGRP_TS);
 	} else {
@@ -417,8 +627,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_cgroup_init, struct cgroup *cgrp,
 	}
 
 #if UFS_DEBUG
-	bpf_printk("ufs: cgroup_init id=%llu name=%s class=%d weight=%u",
-		   id, name, class, cctx->weight);
+	bpf_printk("ufs: cgroup_init id=%llu name=%s class=%d weight=%u slot=%u",
+		   id, name, class, cctx->weight, cctx->slot);
 #endif
 	return 0;
 }
@@ -433,19 +643,34 @@ void BPF_STRUCT_OPS(ufs_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 		return;
 
 	cctx->weight = clamp_weight(weight);
+	if (cctx->has_dsq) {
+		struct ufs_slot *s = slot_get(cctx->slot);
+
+		if (s)
+			s->weight = cctx->weight;
+	}
 #if UFS_DEBUG
 	bpf_printk("ufs: cgroup_set_weight id=%llu raw=%u stored=%u",
 		   cctx->dsq_id, weight, cctx->weight);
 #endif
 }
 
-/* The cgroup is going away: destroy its queue, if it had one. */
+/* The cgroup is going away: destroy its queue and free its slot. */
 void BPF_STRUCT_OPS(ufs_cgroup_exit, struct cgroup *cgrp)
 {
 	struct cgrp_ctx *cctx = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0, 0);
 
 	if (cctx && cctx->has_dsq) {
+		struct ufs_slot *s = slot_get(cctx->slot);
+
+		/* Hide the slot from dispatch before the queue disappears. */
+		if (s)
+			s->state = UFS_SLOT_FILLING;
+
 		scx_bpf_destroy_dsq(cctx->dsq_id);
+
+		if (s)
+			free_slot(s);
 		cctx->has_dsq = 0;
 		stat_inc(ST_CGRP_DESTROYED);
 #if UFS_DEBUG
@@ -456,7 +681,23 @@ void BPF_STRUCT_OPS(ufs_cgroup_exit, struct cgroup *cgrp)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_init)
 {
-	return scx_bpf_create_dsq(SHARED_DSQ, -1);
+	struct ufs_slot *s;
+	int ret;
+
+	/* Slot 0 is the shared queue, used by background tasks without a queue. */
+	ret = scx_bpf_create_dsq(SHARED_DSQ, -1);
+	if (ret)
+		return ret;
+
+	s = slot_get(0);
+	if (s) {
+		s->dsq_id = SHARED_DSQ;
+		s->weight = 100;
+		s->vtime = 0;
+		s->tvtime_now = 0;
+		s->state = UFS_SLOT_READY;
+	}
+	return 0;
 }
 
 void BPF_STRUCT_OPS(ufs_exit, struct scx_exit_info *ei)

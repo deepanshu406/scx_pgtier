@@ -53,7 +53,7 @@ BPF_INCLUDES := -I$(SCX_DIR)/scheds/include \
 CFLAGS := -std=gnu11 -O2 -g -Wall \
 	-I$(SCX_DIR)/scheds/include \
 	-I$(SCX_DIR)/scheds/vmlinux \
-	-I$(BUILD) \
+	-I$(BUILD) -I. \
 	$(LIBBPF_CFLAGS)
 
 LDLIBS := $(LIBBPF_LIBS) -lelf -lz -lzstd -lpthread
@@ -64,7 +64,7 @@ $(BUILD):
 	mkdir -p $@
 
 # 1. BPF C -> BPF object
-$(BUILD)/scx_pgtier.bpf.o: scx_pgtier.bpf.c | $(BUILD)
+$(BUILD)/scx_pgtier.bpf.o: scx_pgtier.bpf.c scx_pgtier.h | $(BUILD)
 	$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDES) -target bpf -c $< -o $@
 
 # 2. Link the object, then generate the skeleton header from it
@@ -75,7 +75,7 @@ $(BUILD)/scx_pgtier.bpf.skel.h: $(BUILD)/scx_pgtier.linked.o
 	$(BPFTOOL) gen skeleton $< name scx_pgtier > $@
 
 # 3. Loader
-$(BUILD)/scx_pgtier: scx_pgtier.c $(BUILD)/scx_pgtier.bpf.skel.h
+$(BUILD)/scx_pgtier: scx_pgtier.c scx_pgtier.h $(BUILD)/scx_pgtier.bpf.skel.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 clean:

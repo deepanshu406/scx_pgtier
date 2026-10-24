@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier loader, step 3B of 7 (tier detection + express lane + per-cgroup
- * records and queues + cgroup weights).
+ * scx_pgtier loader, step 3C of 7 (tier detection + express lane + per-cgroup
+ * queues + cgroup weights + weighted cgroup clocks).
  *
  * Loads the scheduler, keeps it attached, prints the counters once a second,
  * and reports why the scheduler exited. Structure follows scx_simple.c
@@ -18,6 +18,7 @@
 #include <libgen.h>
 #include <bpf/bpf.h>
 #include <scx/common.h>
+#include "scx_pgtier.h"
 #include "scx_pgtier.bpf.skel.h"
 
 /*
@@ -34,13 +35,16 @@
  *  11 cg_destroyed                 a cgroup queue was destroyed
  *  12 cg_err                       creating a record or queue failed
  *  13 cg_wset                      cgroup_set_weight was called
+ *  14 bg_cgq                       bg task put on a cgroup queue
+ *  15 disp_ok                      dispatch moved a task to a local queue
+ *  16 disp_retry                   dispatch lost a race and tried again
  * (The cg_ names avoid the substrings "bg=" and "ts=", which the step 1 test
  * looks for in the output line.)
  */
-#define NR_STATS	14
+#define NR_STATS	17
 
 const char help_fmt[] =
-"scx_pgtier, step 3B: tiers, express lane, per-cgroup queues and weights (partial mode).\n"
+"scx_pgtier, step 3C: tiers, express lane, weighted cgroup queues (partial mode).\n"
 "\n"
 "Only tasks switched to SCHED_EXT are scheduled by this scheduler.\n"
 "cgroup names: ufs-ts-* = time-sensitive, ufs-bg-* = background.\n"
@@ -84,6 +88,23 @@ static void read_stats(struct scx_pgtier *skel, __u64 *stats)
 			continue;
 		for (cpu = 0; cpu < nr_cpus; cpu++)
 			stats[idx] += cnts[idx][cpu];
+	}
+}
+
+/* One line per slot in use. These lines must not start with "bg=". */
+static void print_slots(struct scx_pgtier *skel)
+{
+	int fd = bpf_map__fd(skel->maps.slots);
+	__u32 i;
+
+	for (i = 0; i < UFS_MAX_SLOTS; i++) {
+		struct ufs_slot s;
+
+		if (bpf_map_lookup_elem(fd, &i, &s) < 0 || s.state != UFS_SLOT_READY)
+			continue;
+		printf("  slot %u: id=%llu weight=%u vtime=%llu\n",
+		       i, (unsigned long long)s.dsq_id, s.weight,
+		       (unsigned long long)s.vtime);
 	}
 }
 
@@ -132,9 +153,11 @@ restart:
 		printf("bg=%llu ts=%llu unknown=%llu "
 		       "ts_idle=%llu ts_preempt=%llu ts_queued=%llu ts_nudge=%llu "
 		       "bg_enq=%llu cg_back=%llu cg_time=%llu cg_other=%llu "
-		       "cg_destroyed=%llu cg_err=%llu cg_wset=%llu\n",
+		       "cg_destroyed=%llu cg_err=%llu cg_wset=%llu "
+		       "bg_cgq=%llu disp_ok=%llu disp_retry=%llu\n",
 		       s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-		       s[8], s[9], s[10], s[11], s[12], s[13]);
+		       s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15], s[16]);
+		print_slots(skel);
 		fflush(stdout);
 		sleep(1);
 	}
