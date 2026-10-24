@@ -1,7 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier: step 3A of 7, per-cgroup records and queues (nothing uses the
- * queues yet), on top of step 2, the express lane, and step 1, tier detection.
+ * scx_pgtier: step 3B of 7, cgroup weights, on top of step 3A (per-cgroup
+ * records and queues), step 2 (the express lane) and step 1 (tier detection).
+ *
+ * Step 3B (new): every cgroup record also stores the cgroup's cpu.weight.
+ *   - The starting weight comes in the arguments of cgroup_init.
+ *   - When someone writes to cpu.weight, cgroup_set_weight updates it.
+ *   - The stored weight is clamped to 1..10000 (the range of cpu.weight).
+ * Nothing uses the weight yet; the cgroup virtual clock (step 3C) will.
+ * Assumption: our "ufs-" cgroups are siblings under one parent (no nesting
+ * inside them).
  *
  * Step 3A (new): sched_ext tells us when a cgroup appears (cgroup_init) and
  * when it goes away (cgroup_exit).
@@ -87,6 +95,7 @@ enum ufs_stat {
 	ST_CGRP_OTHER,			/* any other cgroup seen: record made, no queue */
 	ST_CGRP_DESTROYED,		/* a cgroup queue was destroyed in cgroup_exit */
 	ST_CGRP_ERR,			/* creating a record or queue failed */
+	ST_CGRP_WSET,			/* cgroup_set_weight was called */
 	UFS_NR_STATS,
 };
 
@@ -115,8 +124,12 @@ struct {
 struct cgrp_ctx {
 	u8  tier;	/* TIER_TS or TIER_BG */
 	u8  has_dsq;	/* 1 if this cgroup owns a queue */
+	u32 weight;	/* cpu.weight, clamped to 1..10000 */
 	u64 dsq_id;	/* the queue's id: the cgroup's own id */
 };
+
+#define WEIGHT_MIN	1
+#define WEIGHT_MAX	10000
 
 struct {
 	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
@@ -157,6 +170,16 @@ static __always_inline u8 task_tier(struct task_struct *p)
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
 
 	return tctx ? tctx->tier : TIER_BG;
+}
+
+/* Keep a weight inside the range cpu.weight allows. */
+static __always_inline u32 clamp_weight(u32 w)
+{
+	if (w < WEIGHT_MIN)
+		return WEIGHT_MIN;
+	if (w > WEIGHT_MAX)
+		return WEIGHT_MAX;
+	return w;
 }
 
 static __always_inline u8 cpu_state_of(s32 cpu)
@@ -374,6 +397,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_cgroup_init, struct cgroup *cgrp,
 	}
 
 	cctx->tier = (class == CLASS_TS) ? TIER_TS : TIER_BG;
+	cctx->weight = clamp_weight(args->weight);
 	cctx->dsq_id = id;
 	cctx->has_dsq = 0;
 
@@ -393,9 +417,26 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_cgroup_init, struct cgroup *cgrp,
 	}
 
 #if UFS_DEBUG
-	bpf_printk("ufs: cgroup_init id=%llu name=%s class=%d", id, name, class);
+	bpf_printk("ufs: cgroup_init id=%llu name=%s class=%d weight=%u",
+		   id, name, class, cctx->weight);
 #endif
 	return 0;
+}
+
+/* Someone wrote to this cgroup's cpu.weight: store the new value. */
+void BPF_STRUCT_OPS(ufs_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
+{
+	struct cgrp_ctx *cctx = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0, 0);
+
+	stat_inc(ST_CGRP_WSET);
+	if (!cctx)
+		return;
+
+	cctx->weight = clamp_weight(weight);
+#if UFS_DEBUG
+	bpf_printk("ufs: cgroup_set_weight id=%llu raw=%u stored=%u",
+		   cctx->dsq_id, weight, cctx->weight);
+#endif
 }
 
 /* The cgroup is going away: destroy its queue, if it had one. */
@@ -432,6 +473,7 @@ SCX_OPS_DEFINE(pgtier_ops,
 	       .enable		= (void *)ufs_enable,
 	       .cgroup_init	= (void *)ufs_cgroup_init,
 	       .cgroup_exit	= (void *)ufs_cgroup_exit,
+	       .cgroup_set_weight = (void *)ufs_cgroup_set_weight,
 	       .init		= (void *)ufs_init,
 	       .exit		= (void *)ufs_exit,
 	       .flags		= SCX_OPS_SWITCH_PARTIAL,

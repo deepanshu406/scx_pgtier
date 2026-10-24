@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_pgtier loader, step 3A of 7 (tier detection + express lane + per-cgroup
- * records and queues).
+ * scx_pgtier loader, step 3B of 7 (tier detection + express lane + per-cgroup
+ * records and queues + cgroup weights).
  *
  * Loads the scheduler, keeps it attached, prints the counters once a second,
  * and reports why the scheduler exited. Structure follows scx_simple.c
@@ -33,13 +33,14 @@
  *  10 cg_other                     any other cgroup seen: record made
  *  11 cg_destroyed                 a cgroup queue was destroyed
  *  12 cg_err                       creating a record or queue failed
+ *  13 cg_wset                      cgroup_set_weight was called
  * (The cg_ names avoid the substrings "bg=" and "ts=", which the step 1 test
  * looks for in the output line.)
  */
-#define NR_STATS	13
+#define NR_STATS	14
 
 const char help_fmt[] =
-"scx_pgtier, step 3A: tiers, express lane, per-cgroup queues (partial mode).\n"
+"scx_pgtier, step 3B: tiers, express lane, per-cgroup queues and weights (partial mode).\n"
 "\n"
 "Only tasks switched to SCHED_EXT are scheduled by this scheduler.\n"
 "cgroup names: ufs-ts-* = time-sensitive, ufs-bg-* = background.\n"
@@ -131,9 +132,9 @@ restart:
 		printf("bg=%llu ts=%llu unknown=%llu "
 		       "ts_idle=%llu ts_preempt=%llu ts_queued=%llu ts_nudge=%llu "
 		       "bg_enq=%llu cg_back=%llu cg_time=%llu cg_other=%llu "
-		       "cg_destroyed=%llu cg_err=%llu\n",
+		       "cg_destroyed=%llu cg_err=%llu cg_wset=%llu\n",
 		       s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
-		       s[8], s[9], s[10], s[11], s[12]);
+		       s[8], s[9], s[10], s[11], s[12], s[13]);
 		fflush(stdout);
 		sleep(1);
 	}
