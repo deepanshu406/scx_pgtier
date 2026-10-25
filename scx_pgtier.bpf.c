@@ -478,6 +478,11 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 
 			/* Charge: slice * 100 / weight. A heavier cgroup pays less. */
 			weight = s->weight ? s->weight : 100;
+			u64 charge = SCX_SLICE_DFL * 100 / weight;
+			u64 floor  = cg_vtime_now - charge;
+
+			if (time_before(s->vtime, floor))
+				s->vtime = floor; /* racy, tolerated */
 			__sync_fetch_and_add(&s->vtime, SCX_SLICE_DFL * 100 / weight);
 
 			stat_inc(ST_DISP_OK);
