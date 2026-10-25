@@ -1,0 +1,5 @@
+# pgtier extension
+comment = 'Tier and weight control for the scx_pgtier scheduler'
+default_version = '1.0'
+module_pathname = '$libdir/pgtier'
+relocatable = true

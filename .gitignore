@@ -1,3 +1,12 @@
 build/
 *.o
 *.skel.h
+# PostgreSQL extension build output
+*.so
+*.o
+*.bc
+
+# PGXS test output, if you ever add tests
+results/
+regression.diffs
+regression.out
