@@ -10,3 +10,4 @@ build/
 results/
 regression.diffs
 regression.out
+vm_setup.sh

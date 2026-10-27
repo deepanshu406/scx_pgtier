@@ -71,7 +71,7 @@ UEI_DEFINE(uei);
 #define SHARED_DSQ	0
 
 /* Set to 0 to silence the trace_pipe output. */
-#define UFS_DEBUG	1
+#define UFS_DEBUG	0
 
 /* Slice for time-sensitive tasks: short, so a task queued behind one waits little. */
 #define TS_SLICE_NS	(2 * 1000 * 1000ULL)
@@ -132,7 +132,16 @@ enum ufs_cpu_state {
 
 struct task_ctx {
 	u8  tier;
+	u8  path;	/* how the ts task was placed the first time since it last ran */
+	u16 nr_enq;	/* how many times it was placed since it last ran */
 	u32 slot;	/* index into the slots table; 0 = shared queue */
+	u64 enq_ns;	/* when it first became runnable since it last ran; 0 = not waiting */
+	/* what was running on the target CPU when the task was first placed */
+	s32 v_pid;	/* victim pid, -1 = none */
+	u32 v_slice_us;	/* victim's remaining slice, in microseconds */
+	u8  v_pol;	/* victim's scheduling policy: 0 = normal (fair), 7 = ext */
+	u8  v_state;	/* what cpu_state said about the CPU */
+	u8  sync;	/* 1 = placed by the sync-wake rule in select_cpu */
 };
 
 struct {
@@ -383,6 +392,73 @@ static __always_inline void enqueue_bg(struct task_struct *p, u64 enq_flags)
 	scx_bpf_dsq_insert_vtime(p, s->dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
 }
 
+/* ---- wait-time instrument (ts tasks) ---- */
+
+/* Set to 1 to record how long ts tasks wait and print the slow ones (costs throughput). */
+#ifndef UFS_WAIT_TRACE
+#define UFS_WAIT_TRACE	0
+#endif
+
+/* Print a trace line when a ts task waited longer than this to start running. */
+#define SLOW_WAIT_NS	(1ULL * 1000 * 1000ULL)
+
+/* How a ts task was placed. */
+enum ufs_path {
+	PATH_IDLE = 0,		/* idle CPU found in select_cpu */
+	PATH_PREEMPT = 1,	/* head of queue + preempt kick */
+	PATH_QUEUED = 2,	/* behind a running ts task */
+	PATH_NUDGE = 3,		/* CPU with nothing recorded */
+};
+
+#if UFS_WAIT_TRACE
+/* Remember when and how a ts task was placed. Only the first placement counts. */
+static __always_inline void ts_mark(struct task_struct *p, u8 path)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+
+	if (!tctx)
+		return;
+	if (!tctx->enq_ns) {
+		tctx->enq_ns = bpf_ktime_get_ns();
+		tctx->path = path;
+		tctx->nr_enq = 0;
+	}
+	tctx->nr_enq++;
+}
+
+/*
+ * Remember what is running on @cpu right now (only for the first placement
+ * since the task last ran), so a slow wait can be explained afterwards.
+ */
+static __always_inline void victim_mark(struct task_struct *p, s32 cpu, u8 state)
+{
+	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+	struct task_struct *curr;
+	u64 slice;
+
+	if (!tctx || tctx->nr_enq != 1)
+		return;
+
+	tctx->v_state = state;
+	tctx->v_pid = -1;
+	tctx->v_slice_us = 0;
+	tctx->v_pol = 255;
+
+	curr = __COMPAT_scx_bpf_cpu_curr(cpu);
+	if (!curr)
+		return;
+
+	tctx->v_pid = BPF_CORE_READ(curr, pid);
+	tctx->v_pol = BPF_CORE_READ(curr, policy);
+	slice = BPF_CORE_READ(curr, scx.slice);
+	tctx->v_slice_us = slice > 0xffffffffULL * 1000 ? 0xffffffffU : slice / 1000;
+}
+
+#else
+static __always_inline void ts_mark(struct task_struct *p, u8 path) {}
+static __always_inline void victim_mark(struct task_struct *p, s32 cpu, u8 state) {}
+#endif
+
 /* ---- scheduling ---- */
 
 s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -395,6 +471,7 @@ s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
 		if (ts) {
+			ts_mark(p, PATH_IDLE);
 			stat_inc(ST_TS_IDLE);
 			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, TS_SLICE_NS, 0);
 		} else {
@@ -410,6 +487,27 @@ s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 	 */
 	if (ts) {
 		s32 bg_cpu = find_bg_cpu(p, prev_cpu);
+
+		/*
+		 * Sync wake-up: the waker is about to sleep, so its CPU is about to be
+		 * free. Run there: no other CPU needs an interrupt and no bg task is
+		 * pushed off its CPU.
+		 */
+		if (wake_flags & SCX_WAKE_SYNC) {
+			s32 this_cpu = bpf_get_smp_processor_id();
+
+			if (bpf_cpumask_test_cpu(this_cpu, p->cpus_ptr) &&
+			    cpu_state_of(this_cpu) != CPU_TS) {
+#if UFS_WAIT_TRACE
+				struct task_ctx *tc = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+
+				if (tc)
+					tc->sync = 1;
+#endif
+				return this_cpu;
+		     }
+		}
+
 
 		if (bg_cpu >= 0)
 			return bg_cpu;
@@ -433,21 +531,31 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (state == CPU_BG) {
 		/* Express lane: go first and push the background task off. */
+		ts_mark(p, PATH_PREEMPT);
+		victim_mark(p, cpu, state);
 		stat_inc(ST_TS_PREEMPT);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS,
-				   enq_flags | SCX_ENQ_HEAD);
+				   enq_flags | SCX_ENQ_HEAD | SCX_ENQ_PREEMPT);
 		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 	} else if (state == CPU_TS) {
 		/* Collision: never preempt another time-sensitive task. */
+		ts_mark(p, PATH_QUEUED);
+		victim_mark(p, cpu, state);
 		stat_inc(ST_TS_QUEUED);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS,
 				   enq_flags);
 	} else {
 		/* Nothing recorded: idle, or the task just stopped here. */
+		ts_mark(p, PATH_NUDGE);
+		victim_mark(p, cpu, state);
 		stat_inc(ST_TS_NUDGE);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS,
-				   enq_flags);
-		scx_bpf_kick_cpu(cpu, 0);
+		u64 flags = enq_flags;
+		if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu) == 0)
+			flags |= SCX_ENQ_HEAD;
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, TS_SLICE_NS, flags);
+				/* No interrupt needed for the CPU we are running on: it picks next anyway. */
+		if (cpu != bpf_get_smp_processor_id())
+			scx_bpf_kick_cpu(cpu, 0);
 	}
 }
 
@@ -459,10 +567,20 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 {
 	int tries;
 
+	/*
+	 * A ts task whose slice ran out but that still wants the CPU keeps it:
+	 * do not hand the CPU to a background task now, it would hold the CPU for
+	 * a whole slice before the ts task could run again.
+	 */
+	if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED) &&
+	    task_tier(prev) == TIER_TS)
+		return;
+
 	bpf_for(tries, 0, UFS_MAX_PICK_TRIES) {
 		int idx = pick_slot();
 		struct ufs_slot *s;
 		u32 weight;
+		u64 charge, floor;
 
 		if (idx < 0)
 			return;
@@ -472,18 +590,20 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 			continue;
 
 		if (scx_bpf_dsq_move_to_local(s->dsq_id)) {
+			weight = s->weight ? s->weight : 100;
+			charge = SCX_SLICE_DFL * 100 / weight;
+
+			/* Step D: a cgroup that sat idle may only be one charge behind. */
+			floor = cg_vtime_now - charge;
+			if (time_before(s->vtime, floor))
+				s->vtime = floor;
+
 			/* Remember where the clocks are now (racy, tolerated). */
 			if (time_before(cg_vtime_now, s->vtime))
 				cg_vtime_now = s->vtime;
 
 			/* Charge: slice * 100 / weight. A heavier cgroup pays less. */
-			weight = s->weight ? s->weight : 100;
-			u64 charge = SCX_SLICE_DFL * 100 / weight;
-			u64 floor  = cg_vtime_now - charge;
-
-			if (time_before(s->vtime, floor))
-				s->vtime = floor; /* racy, tolerated */
-			__sync_fetch_and_add(&s->vtime, SCX_SLICE_DFL * 100 / weight);
+			__sync_fetch_and_add(&s->vtime, charge);
 
 			stat_inc(ST_DISP_OK);
 			return;
@@ -501,6 +621,20 @@ void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
 
 	cpu_state_set(tier == TIER_TS ? CPU_TS : CPU_BG);
 
+#if UFS_WAIT_TRACE
+	if (tier == TIER_TS && tctx && tctx->enq_ns) {
+		u64 wait = bpf_ktime_get_ns() - tctx->enq_ns;
+
+		if (wait > SLOW_WAIT_NS)
+			bpf_printk("ufs: slow ts pid=%d cpu=%d path=%d enqs=%u wait_us=%llu vpid=%d vpol=%d vslice_us=%u vstate=%d sync=%d",
+				   p->pid, bpf_get_smp_processor_id(), tctx->path,
+				   tctx->nr_enq, wait / 1000, tctx->v_pid, tctx->v_pol,
+				   tctx->v_slice_us, tctx->v_state, tctx->sync);
+		tctx->enq_ns = 0;
+		tctx->sync = 0;
+	}
+#endif
+
 	if (tier == TIER_BG) {
 		struct ufs_slot *s = slot_get(tctx ? tctx->slot : 0);
 
@@ -513,9 +647,35 @@ void BPF_STRUCT_OPS(ufs_stopping, struct task_struct *p, bool runnable)
 {
 	cpu_state_set(CPU_NONE);
 
+#if UFS_WAIT_TRACE
+	/*
+	 * The task is going to sleep: any wait timer still set is stale (the task
+	 * was re-queued after a slice expiry but kept the CPU). Clear it so the
+	 * next wake-up starts a fresh measurement.
+	 */
+	if (!runnable) {
+		struct task_ctx *tc = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+
+		if (tc)
+			tc->enq_ns = 0;
+	}
+#endif
+
 	/* Task clock: time actually used, divided by the task's weight. */
 	if (task_tier(p) == TIER_BG)
 		p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+
+	/*
+	 * A ts task kicked off the CPU by a higher class (it is still runnable) would
+	 * be put back at the head of the local queue by the kernel, ahead of tasks
+	 * that have waited longer. Zero the slice so it goes through ops.enqueue.
+	 */
+	if (runnable) {
+		if (task_tier(p) == TIER_BG)
+			p->scx.slice = 0;
+		else if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | bpf_get_smp_processor_id()) > 0)
+			p->scx.slice = 0;
+	}
 }
 
 /* ---- a task joins sched_ext: tier detection (step 1) and its queue (3C) ---- */
