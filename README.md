@@ -38,22 +38,26 @@ background task at once.
 ## Results
 
 Setup: 8-vCPU VM, PostgreSQL 16, `pgbench` with 8 clients plus 8 long report queries running in a loop,
-30 s per run, scheduler on and off alternated, median of 5 runs.
+30 s per run, scheduler on and off alternated, median of 5 runs after one discarded warm-up pair.
+Repeating the whole set gives results that differ by a few percentage points.
 
 | Mixed workload, full speed | scx_pgtier | EEVDF (stock) | change |
 |---|---|---|---|
-| transactions per second | 17,405 | 14,979 | +16% |
-| p99 latency | 0.92 ms | 1.89 ms | -51% |
-| p99.9 latency | 2.3 ms | 5.9 ms | -61% |
-| report queries completed | 160 | 188 | -15% |
-| report queries completed, same transaction rate (12k tps) | 178 | 191 | -7% |
+| transactions per second | 16,682 | 14,358 | +16% |
+| p99 latency | 0.90 ms | 2.06 ms | -56% |
+| p99.9 latency | 3.0 ms | 6.4 ms | -53% |
+| report queries completed | 160 | 187 | -14% |
+| report queries completed, same transaction rate (12k tps) | 163 | 175 | -7% |
 
 | Solo (no report queries) | scx_pgtier | EEVDF (stock) | change |
 |---|---|---|---|
-| transactions per second | 19,387 | 25,510 | -24% |
+| transactions per second | 19,810 | 25,885 | -23% |
+| p99 latency | 0.66 ms | 0.53 ms | +24% |
 
 - **The time-sensitive tier gains at the background tier's expense.** About 7% fewer report queries
   complete at equal transaction work.
+- **Maximum latency is not improved.** The slowest single transaction in a run is longer with
+  scx_pgtier (median 45 ms against 21 ms). It is one event per run and noisy, but it is not better.
 
 How to reproduce these numbers: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
