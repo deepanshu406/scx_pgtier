@@ -53,7 +53,8 @@ sched_on() {
   sched_off || return 1
   sync; echo 3 > /proc/sys/vm/drop_caches
   cp "$bin" /tmp/scx_pgtier.run
-  ( setsid /tmp/scx_pgtier.run > /tmp/sched.log 2>&1 < /dev/null & )   # subshell: no job-control noise
+  local args=(); [ -n "${SCX_DB:-}" ] && args=(-d "$SCX_DB")
+  ( setsid /tmp/scx_pgtier.run "${args[@]}" > /tmp/sched.log 2>&1 < /dev/null & )   # subshell: no job-control noise
   sleep 3
   [ "$(cat /sys/kernel/sched_ext/state)" = enabled ] || { echo "scheduler did not start:" >&2; tail -n 5 /tmp/sched.log >&2; return 1; }
 }
