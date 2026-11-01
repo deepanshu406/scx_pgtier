@@ -70,6 +70,10 @@ UEI_DEFINE(uei);
 /* Id of the shared queue. It belongs to slot 0. */
 #define SHARED_DSQ	0
 
+/* Id of the shared queue. It belongs to time-sensitive task. */
+#define SHARED_TS_DSQ   10001
+
+
 /* Set to 0 to silence the trace_pipe output. */
 #define UFS_DEBUG	0
 
@@ -86,6 +90,18 @@ const volatile u32 nr_cpus = MAX_CPUS;
 
 /* Clock of the cgroup picked most recently. A new cgroup's clock starts here. */
 u64 cg_vtime_now;
+
+/*
+ * A waiting background task may go this long without any background task
+ * running before we call the system "starved" and let one run.
+ */
+const volatile u64 age_ns = 50 * 1000 * 1000ULL;
+
+/* When a background task last started running (ns). 0 = none has yet. */
+u64 last_bg_run_ns;
+
+/* How many background tasks are waiting for a CPU. Signed: never trust it to stay >= 0. */
+s64 bg_waiting;
 
 /* Tier stored on each task. */
 enum ufs_tier {
@@ -117,6 +133,7 @@ enum ufs_stat {
 	ST_BG_CGQ,			/* bg task put on a cgroup queue */
 	ST_DISP_OK,			/* dispatch moved a task to a CPU's local queue */
 	ST_DISP_RETRY,			/* dispatch lost a race for a queue and tried again */
+	ST_STARVED, 			/* ts enqueues made while bg tasks were starved */
 	UFS_NR_STATS,
 };
 
@@ -142,6 +159,7 @@ struct task_ctx {
 	u8  v_pol;	/* victim's scheduling policy: 0 = normal (fair), 7 = ext */
 	u8  v_state;	/* what cpu_state said about the CPU */
 	u8  sync;	/* 1 = placed by the sync-wake rule in select_cpu */
+	u8  in_bgq;     /* 1 = this bg task is waiting in a queue */
 };
 
 struct {
@@ -200,6 +218,15 @@ struct {
 	__uint(max_entries, UFS_NR_STATS);
 } stats SEC(".maps");
 
+struct {
+        __uint(type, BPF_MAP_TYPE_HASH);
+        __uint(max_entries, 1024);
+        __type(key, u32);       /* PID */
+        __type(value, u8);
+} boost SEC(".maps");
+
+u32 boost_active;       /* the loader sets this to the number of PIDs in the map; 0 = skip all lookups */
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt = bpf_map_lookup_elem(&stats, &idx);
@@ -256,6 +283,24 @@ static __always_inline bool has_prefix(const char *name, const char *prefix)
 		if (name[i] != prefix[i])
 			return false;
 	return true;
+}
+
+/* True if waiting background tasks have been starved for longer than age_ns. */
+static __always_inline bool bg_starved(void)
+{
+	return  bg_waiting > 0 && last_bg_run_ns != 0 &&
+                bpf_ktime_get_ns() - last_bg_run_ns > age_ns;
+}
+
+static __always_inline bool drain_locals(void)
+{
+        return boost_active || bg_starved();
+}
+
+static __always_inline bool is_boosted(struct task_struct *p)
+{
+        u32 pid = p->pid;
+        return boost_active && bpf_map_lookup_elem(&boost, &pid);
 }
 
 /*
@@ -389,6 +434,12 @@ static __always_inline void enqueue_bg(struct task_struct *p, u64 enq_flags)
 		vtime = s->tvtime_now - SCX_SLICE_DFL;
 
 	stat_inc(slot ? ST_BG_CGQ : ST_BG_ENQ);
+	if(tctx && tctx->in_bgq == 0) {
+		tctx->in_bgq = 1;
+		if(bg_waiting == 0)
+			last_bg_run_ns = bpf_ktime_get_ns();
+		__sync_fetch_and_add(&bg_waiting, 1);
+	}
 	scx_bpf_dsq_insert_vtime(p, s->dsq_id, SCX_SLICE_DFL, vtime, enq_flags);
 }
 
@@ -464,12 +515,13 @@ static __always_inline void victim_mark(struct task_struct *p, s32 cpu, u8 state
 s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	bool is_idle = false;
-	bool ts = task_tier(p) == TIER_TS;
+	bool ts = task_tier(p) == TIER_TS || is_boosted(p);
+	bool is_bg_starved = drain_locals();
 	s32 cpu;
 
 	/* 1 and 2: an idle CPU, previous CPU first. Same helper as step 1. */
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
-	if (is_idle) {
+	if (is_idle && !(ts && is_bg_starved)) {
 		if (ts) {
 			ts_mark(p, PATH_IDLE);
 			stat_inc(ST_TS_IDLE);
@@ -485,7 +537,7 @@ s32 BPF_STRUCT_OPS(ufs_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 	 * work. We only RETURN the CPU here; enqueue() inserts the task and
 	 * kicks, so the insert happens before the kick.
 	 */
-	if (ts) {
+	if (ts && !is_bg_starved) {
 		s32 bg_cpu = find_bg_cpu(p, prev_cpu);
 
 		/*
@@ -520,9 +572,17 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu;
 	u8 state;
 
-	if (task_tier(p) != TIER_TS) {
+	if (task_tier(p) != TIER_TS && !is_boosted(p)) {
 		enqueue_bg(p, enq_flags);
 		return;
+	}
+
+	if (drain_locals()) {
+		u64 flags = enq_flags | (is_boosted(p) ? SCX_ENQ_HEAD : 0);
+		stat_inc(ST_STARVED);
+        	scx_bpf_dsq_insert(p, SHARED_TS_DSQ, TS_SLICE_NS, flags);
+        	scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_IDLE);
+        	return;
 	}
 
 	/* The CPU select_cpu() chose, or the CPU the task was running on. */
@@ -559,6 +619,25 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 }
 
+static __always_inline bool scan_boosted(void)
+{
+        int i;
+
+        bpf_for(i, 0, UFS_MAX_SLOTS) {
+                struct ufs_slot *s = slot_get(i);
+                struct task_struct *q;
+
+                if (!s)
+                        continue;
+                bpf_for_each(scx_dsq, q, s->dsq_id, 0) {
+                        if (is_boosted(q) &&
+                            scx_bpf_dsq_move(BPF_FOR_EACH_ITER, q, SCX_DSQ_LOCAL, 0))
+                                return true;
+                }
+        }
+        return false;
+}
+
 /*
  * This CPU's local queue is empty: pick the cgroup with the lowest clock, take
  * its first task, and charge the cgroup for one slice.
@@ -566,6 +645,15 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 {
 	int tries;
+	bool is_bg_starved = bg_starved();
+
+	if (boost_active && scan_boosted()) return;
+
+	  if(!is_bg_starved) {
+                if(scx_bpf_dsq_move_to_local(SHARED_TS_DSQ))
+                        return;
+        }
+
 
 	/*
 	 * A ts task whose slice ran out but that still wants the CPU keeps it:
@@ -573,7 +661,7 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 	 * a whole slice before the ts task could run again.
 	 */
 	if (prev && (BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED) &&
-	    task_tier(prev) == TIER_TS)
+	    task_tier(prev) == TIER_TS && !is_bg_starved && !boost_active)
 		return;
 
 	bpf_for(tries, 0, UFS_MAX_PICK_TRIES) {
@@ -611,6 +699,8 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 		/* Another CPU emptied the queue first: look again. */
 		stat_inc(ST_DISP_RETRY);
 	}
+
+	scx_bpf_dsq_move_to_local(SHARED_TS_DSQ);
 }
 
 /* Record what each CPU is running, and how far the cgroup's tasks have got. */
@@ -619,7 +709,7 @@ void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
 	u8 tier = tctx ? tctx->tier : TIER_BG;
 
-	cpu_state_set(tier == TIER_TS ? CPU_TS : CPU_BG);
+	cpu_state_set((tier == TIER_TS || is_boosted(p)) ? CPU_TS : CPU_BG);
 
 #if UFS_WAIT_TRACE
 	if (tier == TIER_TS && tctx && tctx->enq_ns) {
@@ -640,6 +730,13 @@ void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
 
 		if (s && time_before(s->tvtime_now, p->scx.dsq_vtime))
 			s->tvtime_now = p->scx.dsq_vtime;	/* racy, tolerated */
+		if(tctx && tctx->in_bgq == 1) {
+			tctx->in_bgq = 0;
+			__sync_fetch_and_add(&bg_waiting, -1);
+			if(bg_waiting < 0)
+				bg_waiting = 0;
+			last_bg_run_ns = bpf_ktime_get_ns();
+		}
 	}
 }
 
@@ -862,6 +959,10 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ufs_init)
 		s->tvtime_now = 0;
 		s->state = UFS_SLOT_READY;
 	}
+
+	ret = scx_bpf_create_dsq(SHARED_TS_DSQ, -1);
+	if(ret)
+		return ret;
 	return 0;
 }
 

@@ -35,6 +35,10 @@ PKGCFG := PKG_CONFIG_PATH='$(LIBBPF_PREFIX)/lib64/pkgconfig:$(LIBBPF_PREFIX)/lib
 LIBBPF_CFLAGS := $(shell $(PKGCFG) --cflags libbpf)
 LIBBPF_LIBS   := $(shell $(PKGCFG) --libs libbpf)
 
+# libpq: the loader asks PostgreSQL which backends block others (-d option).
+PQ_CFLAGS := $(shell pkg-config --cflags libpq)
+PQ_LIBS   := $(shell pkg-config --libs libpq)
+
 # Fail early if we picked up the system libbpf instead of the local one.
 ifeq ($(findstring $(LIBBPF_PREFIX),$(LIBBPF_CFLAGS)),)
   $(warning libbpf from $(LIBBPF_PREFIX) not found by pkg-config; using the system one, which may not match bpftool)
@@ -54,9 +58,9 @@ CFLAGS := -std=gnu11 -O2 -g -Wall \
 	-I$(SCX_DIR)/scheds/include \
 	-I$(SCX_DIR)/scheds/vmlinux \
 	-I$(BUILD) -I. \
-	$(LIBBPF_CFLAGS)
+	$(LIBBPF_CFLAGS) $(PQ_CFLAGS)
 
-LDLIBS := $(LIBBPF_LIBS) -lelf -lz -lzstd -lpthread
+LDLIBS := $(LIBBPF_LIBS) $(PQ_LIBS) -lelf -lz -lzstd -lpthread
 
 all: $(BUILD)/scx_pgtier
 
