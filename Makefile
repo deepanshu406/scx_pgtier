@@ -60,7 +60,8 @@ CFLAGS := -std=gnu11 -O2 -g -Wall \
 	-I$(BUILD) -I. \
 	$(LIBBPF_CFLAGS) $(PQ_CFLAGS)
 
-LDLIBS := $(LIBBPF_LIBS) $(PQ_LIBS) -lelf -lz -lzstd -lpthread
+LDLIBS := $(LIBBPF_LIBS) $(PQ_LIBS) -lelf -lz -lzstd -lpthread \
+	$(foreach d,$(patsubst -L%,%,$(filter -L%,$(LIBBPF_LIBS))),-Wl,-rpath,$(d))
 
 all: $(BUILD)/scx_pgtier
 
