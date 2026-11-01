@@ -67,6 +67,10 @@ make SCX_DIR=/path/to/scx-c-examples LIBBPF_PREFIX=/path/to/libbpf/install
 If `make` warns that libbpf was not found in `LIBBPF_PREFIX`, it used the system libbpf, which may
 not match bpftool.
 
+The libbpf install directory is stored in the binary (rpath). 
+If you move or delete it, rebuild, 
+or set LD_LIBRARY_PATH to the new location.
+
 **4. The PostgreSQL extension** (`pgext/`), which puts each backend into its tier's cgroup:
 
 ```
