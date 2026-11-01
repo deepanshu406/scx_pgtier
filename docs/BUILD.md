@@ -23,10 +23,11 @@ Contents: [Requirements](#requirements) · [Build](#build) · [Run](#run-it-by-h
 
 ```
 sudo apt install build-essential git pkg-config clang llvm \
-     libelf-dev zlib1g-dev libzstd-dev linux-tools-$(uname -r) \
+     libelf-dev zlib1g-dev libzstd-dev libpq-dev linux-tools-$(uname -r) \
      postgresql-16 postgresql-contrib postgresql-server-dev-16
 ```
 
+`libpq-dev` is needed by the loader, which asks PostgreSQL for lock holders (`-d`).
 `pgbench` is in `postgresql-contrib` on some releases. `postgresql-server-dev-16` is needed to
 build the PostgreSQL extension.
 
@@ -98,6 +99,14 @@ Run `pg_config --pgxs` first if you want to check which PostgreSQL it will insta
    Then reload the configuration. A new connection as `oltp_app` runs in a `ufs-ts-*` cgroup.
 4. **Start the scheduler** as root: `sudo ./build/scx_pgtier`. Stop it with Ctrl-C and the kernel
    returns to its default scheduler. `cat /sys/kernel/sched_ext/state` says `enabled` while it runs.
+5. **Lock-holder boost (optional).** Start it with a connection string:
+   ```
+   sudo ./build/scx_pgtier -d "host=/tmp port=5432 dbname=postgres user=postgres"
+   ```
+   The loader then asks PostgreSQL every 20 ms which backends block others and boosts the ones in a
+   `ufs-bg-*` cgroup. Use a role that may read `pg_stat_activity`, and that has no `pgtier.tier`, so its
+   own backend stays outside the tiers. If the connection fails, the scheduler keeps running without
+   the boost and retries every second. Without `-d` nothing is boosted (aging still applies).
 
 The scheduler runs in *partial* mode: only tasks switched to the sched_ext class are affected.
 
