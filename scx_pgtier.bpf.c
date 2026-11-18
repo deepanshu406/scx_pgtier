@@ -80,6 +80,8 @@ UEI_DEFINE(uei);
 /* Slice for time-sensitive tasks: short, so a task queued behind one waits little. */
 #define TS_SLICE_NS	(2 * 1000 * 1000ULL)
 
+#define BOOST_SLICE_NS	(20ULL * 1000 * 1000)	/* 20 ms for a boosted lock holder */
+
 /* How many times dispatch() tries again after losing a race for a queue. */
 #define UFS_MAX_PICK_TRIES	4
 
@@ -580,7 +582,8 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 	if (drain_locals()) {
 		u64 flags = enq_flags | (is_boosted(p) ? SCX_ENQ_HEAD : 0);
 		stat_inc(ST_STARVED);
-        	scx_bpf_dsq_insert(p, SHARED_TS_DSQ, TS_SLICE_NS, flags);
+        	scx_bpf_dsq_insert(p, SHARED_TS_DSQ,
+                                   is_boosted(p) ? BOOST_SLICE_NS : TS_SLICE_NS, flags);
         	scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_IDLE);
         	return;
 	}
@@ -671,7 +674,7 @@ void BPF_STRUCT_OPS(ufs_dispatch, s32 cpu, struct task_struct *prev)
 		u64 charge, floor;
 
 		if (idx < 0)
-			return;
+			break;
 
 		s = slot_get(idx);
 		if (!s || s->state != UFS_SLOT_READY)
