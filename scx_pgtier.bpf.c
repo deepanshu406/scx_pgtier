@@ -229,6 +229,107 @@ struct {
 
 u32 boost_active;       /* the loader sets this to the number of PIDs in the map; 0 = skip all lookups */
 
+/*
+ * Boost trace (loader option -b). When trace_on is 0 (the default) none of this
+ * runs. The loader creates one entry per boosted holder; the callbacks below
+ * add up how long that task waits in our queues and how long it runs.
+ */
+const volatile bool trace_on;
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, u32);	/* PID */
+	__type(value, struct ufs_btrace);
+} btrace SEC(".maps");
+
+static __always_inline struct ufs_btrace *bt_get(struct task_struct *p)
+{
+	u32 pid;
+
+	if (!trace_on)
+		return NULL;
+	pid = p->pid;
+	return bpf_map_lookup_elem(&btrace, &pid);
+}
+
+/* The task was handed to ops.enqueue. */
+static __always_inline void bt_enqueue(struct task_struct *p)
+{
+	struct ufs_btrace *t = bt_get(p);
+
+	if (!t)
+		return;
+	if (!t->first_ev)
+		t->first_ev = BT_EV_ENQUEUE;
+	t->nr_enq++;
+	if (!t->enq_ns)
+		t->enq_ns = bpf_ktime_get_ns();
+}
+
+/* The task starts running: close the wait. */
+static __always_inline void bt_running(struct task_struct *p)
+{
+	struct ufs_btrace *t = bt_get(p);
+	u64 now, start;
+
+	if (!t)
+		return;
+	now = bpf_ktime_get_ns();
+	if (!t->first_ev)
+		t->first_ev = BT_EV_RUNNING;
+	if (!t->first_run_ns)
+		t->first_run_ns = now;
+	/*
+	 * Waiting since the enqueue. If it was already waiting in a queue when the
+	 * boost was set (first event is running), it has waited at least since set_ns.
+	 */
+	start = t->enq_ns;
+	if (!start && t->first_ev == BT_EV_RUNNING && t->nr_run == 0)
+		start = t->set_ns;
+	if (start && now > start) {
+		u64 w = now - start;
+
+		t->wait_ns += w;
+		if (w > t->max_wait_ns)
+			t->max_wait_ns = w;
+	}
+	t->enq_ns = 0;
+	t->nr_run++;
+	t->run_start_ns = now;
+	t->slice_given_ns += p->scx.slice;
+}
+
+/* The task leaves the CPU: close the run. */
+static __always_inline void bt_stopping(struct task_struct *p, bool runnable)
+{
+	struct ufs_btrace *t = bt_get(p);
+	u64 now, start;
+
+	if (!t)
+		return;
+	now = bpf_ktime_get_ns();
+	if (!t->first_ev)
+		t->first_ev = BT_EV_STOPPING;
+	/* It was already on a CPU when the boost was set: count from set_ns. */
+	start = t->run_start_ns;
+	if (!start && t->first_ev == BT_EV_STOPPING && t->nr_run == 0)
+		start = t->set_ns;
+	if (start && now > start)
+		t->run_ns += now - start;
+	t->run_start_ns = 0;
+
+	/* Why did it stop? Must run before ufs_stopping() zeroes the slice. */
+	if (!runnable) {
+		t->nr_stop_sleep++;
+	} else if (p->scx.slice > 1000000ULL) {
+		t->nr_stop_early++;
+		t->early_left_ns += p->scx.slice;
+	} else {
+		t->nr_stop_end++;
+	}
+}
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt = bpf_map_lookup_elem(&stats, &idx);
@@ -574,6 +675,8 @@ void BPF_STRUCT_OPS(ufs_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu;
 	u8 state;
 
+	bt_enqueue(p);
+
 	if (task_tier(p) != TIER_TS && !is_boosted(p)) {
 		enqueue_bg(p, enq_flags);
 		return;
@@ -712,6 +815,7 @@ void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
 	u8 tier = tctx ? tctx->tier : TIER_BG;
 
+	bt_running(p);
 	cpu_state_set((tier == TIER_TS || is_boosted(p)) ? CPU_TS : CPU_BG);
 
 #if UFS_WAIT_TRACE
@@ -745,6 +849,7 @@ void BPF_STRUCT_OPS(ufs_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(ufs_stopping, struct task_struct *p, bool runnable)
 {
+	bt_stopping(p, runnable);
 	cpu_state_set(CPU_NONE);
 
 #if UFS_WAIT_TRACE

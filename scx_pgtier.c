@@ -65,7 +65,7 @@ const char help_fmt[] =
 "Only tasks switched to SCHED_EXT are scheduled by this scheduler.\n"
 "cgroup names: ufs-ts-* = time-sensitive, ufs-bg-* = background.\n"
 "\n"
-"Usage: %s [-v] [-d CONNINFO]\n"
+"Usage: %s [-v] [-b] [-d CONNINFO]\n"
 "\n"
 "  -d CONNINFO   PostgreSQL connection string (for example\n"
 "                \"host=/tmp port=5433 dbname=bench user=postgres\").\n"
@@ -73,6 +73,9 @@ const char help_fmt[] =
 "                as time-sensitive while they block. Use a role that has no\n"
 "                pgtier.tier, and that may read pg_stat_activity.\n"
 "                Without -d, nothing is boosted.\n"
+"  -b            With -d: print one line per boost (when it started, how long it\n"
+"                lasted, CPU used and CPU wait of the holder). Uses a heavier\n"
+"                query (pg_locks), so use it for measuring only.\n"
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
 
@@ -175,6 +178,176 @@ static bool is_bg_pid(__u32 pid)
 }
 
 /*
+ * Boost trace (-b): one record per holder that is being boosted.
+ *   wait_since   when the first waiter started to wait (pg_locks.waitstart), 0 if unknown
+ *   seen         when this loader first saw the holder blocking someone
+ *   cpu0/delay0  /proc/PID/schedstat at that moment (CPU time, time waiting for a CPU)
+ *   cpu1/delay1  the last reading while the holder was alive
+ * The holder exits right after it commits, so the "end" numbers are the last
+ * reading taken while it was alive (at most one poll, 20 ms, before the end).
+ */
+#define MAX_TRACE	64
+
+struct btrace {
+	__u32 pid;
+	double wait_since, seen;
+	__u64 cpu0, delay0, cpu1, delay1;
+};
+
+static bool boost_trace;
+static struct btrace trace[MAX_TRACE];
+static int ntrace;
+
+/* Wall clock in seconds; pg_locks.waitstart is wall clock too. */
+static double now_s(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* CLOCK_MONOTONIC in ns: the clock bpf_ktime_get_ns() uses. */
+static __u64 mono_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* CPU time and run-queue wait (both ns) of a process. 0 on success. */
+static int read_sched(__u32 pid, __u64 *cpu, __u64 *delay)
+{
+	char path[64];
+	unsigned long long a, b;
+	FILE *f;
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%u/schedstat", pid);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+	n = fscanf(f, "%llu %llu", &a, &b);
+	fclose(f);
+	if (n != 2)
+		return -1;
+	*cpu = a;
+	*delay = b;
+	return 0;
+}
+
+/*
+ * Called once per poll with the holders found now (cur) and the time their first
+ * waiter started waiting (since, 0 if unknown). Starts a record for a new
+ * holder, refreshes the readings of the others, and prints and drops the
+ * records of holders that are gone.
+ */
+static void trace_poll(struct scx_pgtier *skel, const __u32 *cur, const double *since, int ncur)
+{
+	double t = now_s();
+	int i, j;
+
+	for (j = 0; j < ntrace; ) {
+		struct btrace *b = &trace[j];
+		bool still = false;
+		__u64 c, d;
+
+		for (i = 0; i < ncur; i++) {
+			if (cur[i] == b->pid) {
+				still = true;
+				break;
+			}
+		}
+		if (still) {
+			j++;
+			continue;
+		}
+		if (read_sched(b->pid, &c, &d) == 0) {
+			b->cpu1 = c;
+			b->delay1 = d;
+		}
+		printf("boost pid %u: noticed ", b->pid);
+		if (b->wait_since > 0)
+			printf("%.0f ms after the waiter started waiting", (b->seen - b->wait_since) * 1e3);
+		else
+			printf("(waiter start unknown)");
+		printf(", boost lasted %.3f s", t - b->seen);
+		if (b->wait_since > 0)
+			printf(", waiter waited %.3f s in total", t - b->wait_since);
+		printf("\n  cpu before boost %.3f s; during boost: cpu %.3f s, waiting for a cpu %.3f s\n",
+		       b->cpu0 / 1e9, (b->cpu1 - b->cpu0) / 1e9, (b->delay1 - b->delay0) / 1e9);
+		{
+			struct ufs_btrace bt;
+			double dur = t - b->seen, other;
+			const char *what[] = { "unknown", "had just woken up", "was waiting in a queue",
+					       "was running on a CPU" };
+
+			if (bpf_map_lookup_elem(bpf_map__fd(skel->maps.btrace), &b->pid, &bt) == 0) {
+				other = dur - (bt.wait_ns + bt.run_ns) / 1e9;
+				if (other < 0)
+					other = 0;
+				printf("  scheduler view: at boost time the holder %s;\n",
+				       what[bt.first_ev <= BT_EV_STOPPING ? bt.first_ev : 0]);
+				if (bt.first_run_ns)
+					printf("    boost set -> first ran: %.1f ms;",
+					       (bt.first_run_ns - bt.set_ns) / 1e6);
+				else
+					printf("    boost set -> never ran;");
+				printf(" waiting in our queues: %.3f s (%u runs, longest wait %.1f ms);\n",
+				       bt.wait_ns / 1e9, bt.nr_run, bt.max_wait_ns / 1e6);
+				printf("    on a CPU: %.3f s; neither (asleep or unaccounted): %.3f s;"
+				       " enqueued %u times\n",
+				       bt.run_ns / 1e9, other, bt.nr_enq);
+				printf("    slice at start of a run: %.2f ms on average;"
+				       " stops: %u slice ended, %u kicked off early",
+				       bt.nr_run ? bt.slice_given_ns / 1e6 / bt.nr_run : 0.0,
+				       bt.nr_stop_end, bt.nr_stop_early);
+				if (bt.nr_stop_early)
+					printf(" (%.2f ms of slice left on average)",
+					       bt.early_left_ns / 1e6 / bt.nr_stop_early);
+				printf(", %u went to sleep\n", bt.nr_stop_sleep);
+			}
+			bpf_map_delete_elem(bpf_map__fd(skel->maps.btrace), &b->pid);
+		}
+		fflush(stdout);
+		*b = trace[--ntrace];
+	}
+
+	for (i = 0; i < ncur; i++) {
+		struct btrace *b = NULL;
+		__u64 c, d;
+
+		for (j = 0; j < ntrace; j++) {
+			if (trace[j].pid == cur[i]) {
+				b = &trace[j];
+				break;
+			}
+		}
+		if (b) {
+			if (read_sched(cur[i], &c, &d) == 0) {
+				b->cpu1 = c;
+				b->delay1 = d;
+			}
+			if (since[i] > 0 && (b->wait_since == 0 || since[i] < b->wait_since))
+				b->wait_since = since[i];
+		} else if (ntrace < MAX_TRACE && read_sched(cur[i], &c, &d) == 0) {
+			struct ufs_btrace bt = {};
+
+			b = &trace[ntrace++];
+			b->pid = cur[i];
+			b->wait_since = since[i];
+			b->seen = t;
+			b->cpu0 = b->cpu1 = c;
+			b->delay0 = b->delay1 = d;
+			/* Created before the PID goes into the boost map. */
+			bt.set_ns = mono_ns();
+			bpf_map_update_elem(bpf_map__fd(skel->maps.btrace), &b->pid, &bt, BPF_ANY);
+		}
+	}
+}
+
+/*
  * Ask PostgreSQL which backends block other backends, and make the "boost" map
  * match (background backends only). A failure here must never stop the scheduler: on any error the map is
  * emptied (so no stale PID stays boosted) and the next try is a second later.
@@ -184,6 +357,7 @@ static void boost_poll(struct scx_pgtier *skel)
 	static time_t last_try;
 	static bool warned;
 	__u32 cur[MAX_BOOST];
+	double since[MAX_BOOST];
 	int ncur = 0, rows, i, j;
 	__u8 one = 1;
 	PGresult *res;
@@ -214,7 +388,15 @@ static void boost_poll(struct scx_pgtier *skel)
 		fprintf(stderr, "boost: connected to PostgreSQL\n");
 	}
 
-	res = PQexec(conn,
+	/*
+	 * Without -b this is the normal query. With -b the query also returns when
+	 * the first waiter started waiting (pg_locks.waitstart, PostgreSQL 14+).
+	 */
+	res = PQexec(conn, boost_trace ?
+		     "SELECT h.holder, extract(epoch FROM min(l.waitstart))::float8 "
+		     "FROM pg_locks l "
+		     "CROSS JOIN LATERAL unnest(pg_blocking_pids(l.pid)) AS h(holder) "
+		     "WHERE NOT l.granted GROUP BY h.holder" :
 		     "SELECT DISTINCT unnest(pg_blocking_pids(pid)) "
 		     "FROM pg_stat_activity WHERE wait_event_type = 'Lock'");
 	if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -230,10 +412,16 @@ static void boost_poll(struct scx_pgtier *skel)
 	for (i = 0; i < rows && ncur < MAX_BOOST; i++) {
 		__u32 pid = (__u32)atoi(PQgetvalue(res, i, 0));
 
-		if (is_bg_pid(pid))
+		if (is_bg_pid(pid)) {
+			since[ncur] = (boost_trace && PQnfields(res) > 1 && !PQgetisnull(res, i, 1)) ?
+				      atof(PQgetvalue(res, i, 1)) : 0;
 			cur[ncur++] = pid;
+		}
 	}
 	PQclear(res);
+
+	if (boost_trace)
+		trace_poll(skel, cur, since, ncur);
 
 	/* Add the new PIDs first, then drop the ones that are no longer blocking. */
 	for (i = 0; i < ncur; i++)
@@ -271,13 +459,16 @@ int main(int argc, char **argv)
 restart:
 	skel = SCX_OPS_OPEN(pgtier_ops, scx_pgtier);
 
-	while ((opt = getopt(argc, argv, "vhd:")) != -1) {
+	while ((opt = getopt(argc, argv, "vhbd:")) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose = true;
 			break;
 		case 'd':
 			conninfo = optarg;
+			break;
+		case 'b':
+			boost_trace = true;
 			break;
 		default:
 			fprintf(stderr, help_fmt, basename(argv[0]));
@@ -294,6 +485,7 @@ restart:
 
 	/* Tell the BPF side how many CPUs to scan. */
 	skel->rodata->nr_cpus = libbpf_num_possible_cpus();
+	skel->rodata->trace_on = boost_trace;
 
 	SCX_OPS_LOAD(skel, pgtier_ops, scx_pgtier, uei);
 	link = SCX_OPS_ATTACH(skel, pgtier_ops, scx_pgtier);
