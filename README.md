@@ -89,6 +89,11 @@ starts for the holder (2 s and 0.3 s), so compare each row only within itself. S
 
 How to reproduce these numbers: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
+## Known limits
+
+**Local clients in the normal class.** sched_ext runs in partial mode, and tasks in the normal scheduling class outrank it. A client or pooler on the same host that is not under sched_ext preempts backends on every reply, which cuts select-only throughput sharply (about -72% at 32 `pgbench` clients on an 8-vCPU VM). With the client placed in a `ufs-ts-` cgroup under sched_ext, the same test reached about 498k tps (EEVDF: about 430k). Remote clients are not affected. If a client or pooler shares the host, put it in a `ufs-ts-` cgroup. Tasks in neither cgroup are treated as background.
+
+
 ## Build and run
 
 See [docs/BUILD.md](docs/BUILD.md). Requires a kernel with sched_ext.
