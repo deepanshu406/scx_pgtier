@@ -98,6 +98,8 @@ Medians of 5 alternating pairs.
 | p99.9 latency | 815 us | 651 us | +25% |
 | max latency | 4.0 ms | 2.7 ms | +51% |
 
+*Measured in a VM whose vCPUs halt when idle; see "Known limits" in the [README](../README.md).*
+
 **Mixed at a fixed rate (`-R 12000`)**
 
 | | scx_pgtier | EEVDF | change |

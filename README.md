@@ -93,6 +93,7 @@ How to reproduce these numbers: [docs/BENCHMARK.md](docs/BENCHMARK.md).
 
 **Local clients in the normal class.** sched_ext runs in partial mode, and tasks in the normal scheduling class outrank it. A client or pooler on the same host that is not under sched_ext preempts backends on every reply, which cuts select-only throughput sharply (about -72% at 32 `pgbench` clients on an 8-vCPU VM). With the client placed in a `ufs-ts-` cgroup under sched_ext, the same test reached about 498k tps (EEVDF: about 430k). Remote clients are not affected. If a client or pooler shares the host, put it in a `ufs-ts-` cgroup. Tasks in neither cgroup are treated as background.
 
+**Solo throughput in a VM.** With no background work, a single-tier workload ran about 12–23% below EEVDF in our 8-vCPU QEMU VM, with each Postgres time slice taking about 25% more CPU. The cause is the cost of waking a halted vCPU: the scheduler places most wake-ups on an idle CPU, and in the VM each such wake-up pays a host-side cost that EEVDF often avoids by reusing a CPU that is already awake. With `idle=poll` on the guest kernel (vCPUs never halt) the two were within about 2–6% on throughput, and the per-slice CPU time was equal. We have not measured this on real hardware or EC2, so check the solo case on your own instance type before relying on a number.
 
 ## Build and run
 
